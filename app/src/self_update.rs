@@ -103,9 +103,13 @@ fn work_dir() -> Result<PathBuf, String> {
     // The temporary folder may be shared (/tmp on Linux): the folder must be new and only ours,
     // else another user could have made it beforehand and swap what gets installed
     let _ = std::fs::remove_dir_all(&dir);
-    let mut builder = std::fs::DirBuilder::new();
+    let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    let builder = {
+        let mut builder = builder;
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+    };
     builder
         .create(&dir)
         .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
