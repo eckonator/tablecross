@@ -100,8 +100,15 @@ fn work_dir() -> Result<PathBuf, String> {
     static RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("tablecross-update-{}-{run}", std::process::id()));
+    // The temporary folder may be shared (/tmp on Linux): the folder must be new and only ours,
+    // else another user could have made it beforehand and swap what gets installed
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&dir)
+        .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
     Ok(dir)
 }
 

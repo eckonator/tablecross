@@ -20,7 +20,8 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, GetNamedPipeClientSessionId,
+    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
 use windows_sys::Win32::System::Services::{
@@ -32,8 +33,9 @@ use windows_sys::Win32::System::Services::{
 };
 use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, HDESK, OpenInputDesktop, SetThreadDesktop};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId, OpenProcessToken,
-    PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
+    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 
@@ -42,7 +44,8 @@ const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
 
 const SERVICE_NAME: &str = "TableCross";
 const DISPLAY_NAME: &str = "TableCross Service";
-/// SYSTEM and administrators fully, interactive users may write (their own session's input).
+/// SYSTEM and administrators fully, interactive users may write. Pipe names are shared by all
+/// sessions, so `client_allowed` also checks who connected.
 const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
 const GENERIC_ALL: u32 = 0x1000_0000;
 /// The input desktop is looked up again at most this often (and after every refusal).
@@ -385,6 +388,14 @@ fn agent() {
         }
         // A client that connected before this call is fine too (ERROR_PIPE_CONNECTED)
         unsafe { ConnectNamedPipe(pipe, std::ptr::null_mut()) };
+        if let Err(reason) = client_allowed(pipe, session) {
+            log(&format!("refused a client of the pipe: {reason}"));
+            unsafe {
+                DisconnectNamedPipe(pipe);
+                CloseHandle(pipe);
+            }
+            continue;
+        }
         let mut file = unsafe { File::from_raw_handle(pipe) };
         while let Some(message) = read_message(&mut file) {
             desktop.follow(false);
@@ -399,6 +410,44 @@ fn agent() {
     #[allow(unreachable_code)]
     unsafe {
         LocalFree(descriptor);
+    }
+}
+
+/// Only programs from this program's folder (installed by the administrator) running in this
+/// session may send input: a user of another session (switched away, remote desktop) or any other
+/// program would otherwise type with SYSTEM rights, also into the sign-in screen and UAC prompts.
+fn client_allowed(pipe: HANDLE, session: u32) -> Result<(), String> {
+    let (mut client_session, mut pid) = (u32::MAX, 0u32);
+    if unsafe { GetNamedPipeClientSessionId(pipe, &mut client_session) } == 0 {
+        return Err(last_error("asking for the client's session"));
+    }
+    if client_session != session {
+        return Err(format!("it runs in session {client_session}, not {session}"));
+    }
+    if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
+        return Err(last_error("asking for the client's process"));
+    }
+    let image = process_image(pid).ok_or("cannot ask for the client's program")?;
+    let own = std::env::current_exe().map_err(|e| e.to_string())?;
+    let folder = |p: &std::path::Path| p.parent().map(|d| d.to_string_lossy().to_lowercase());
+    if folder(&image).is_none() || folder(&image) != folder(&own) {
+        return Err(format!("{} is not from {}", image.display(), own.display()));
+    }
+    Ok(())
+}
+
+fn process_image(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut buffer = vec![0u16; 32 * 1024];
+        let mut len = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(process);
+        ok.then(|| std::ffi::OsString::from_wide(&buffer[..len as usize]).into())
     }
 }
 

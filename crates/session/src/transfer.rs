@@ -135,7 +135,25 @@ pub async fn send(
     out.finish().await.map_err(|e| e.to_string())
 }
 
-async fn read_exact(stream: &mut InStream, buf: &mut [u8]) -> Result<bool, String> {
+/// Where received entries come from: a stream, or bytes in tests.
+trait Incoming {
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+impl Incoming for InStream {
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        InStream::read(self, buf).await
+    }
+}
+
+#[cfg(test)]
+impl Incoming for &[u8] {
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(self, buf)
+    }
+}
+
+async fn read_exact(stream: &mut impl Incoming, buf: &mut [u8]) -> Result<bool, String> {
     let mut filled = 0;
     while filled < buf.len() {
         let n = stream.read(&mut buf[filled..]).await.map_err(|e| e.to_string())?;
@@ -186,15 +204,17 @@ pub async fn receive(
 }
 
 async fn receive_into(
-    stream: &mut InStream,
+    stream: &mut impl Incoming,
     partial: &Path,
     cancel: &AtomicBool,
     progress: &mut Progress<impl Fn(u64)>,
 ) -> Result<Vec<String>, String> {
     tokio::fs::create_dir_all(partial).await.map_err(|e| e.to_string())?;
     let mut roots: Vec<String> = Vec::new();
-    // Nothing is written below or onto a link: following it could lead elsewhere
-    let mut links: Vec<String> = Vec::new();
+    // Nothing is written below or onto a link: following it could lead elsewhere. Links are made
+    // only after everything else, so no write can go through one (names that differ only in case
+    // or Unicode form are the same on some file systems and slip past comparing strings)
+    let mut links: Vec<(String, String, PathBuf)> = Vec::new();
     let mut buf = vec![0; CHUNK];
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -216,7 +236,7 @@ async fn receive_into(
         let path = files::safe_join(partial, &entry.path).ok_or("unsafe path")?;
         if links
             .iter()
-            .any(|l| entry.path == *l || entry.path.starts_with(&format!("{l}/")))
+            .any(|(l, _, _)| entry.path == *l || entry.path.starts_with(&format!("{l}/")))
         {
             return Err("unsafe path".into());
         }
@@ -230,13 +250,7 @@ async fn receive_into(
                 if !files::link_ok(&entry.path, target) {
                     return Err("unsafe link".into());
                 }
-                links.push(entry.path.clone());
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
-                }
-                // Windows makes links only for administrators: left out there
-                #[cfg(unix)]
-                tokio::fs::symlink(target, &path).await.map_err(|e| e.to_string())?;
+                links.push((entry.path.clone(), target.clone(), path));
             }
             Kind::File | Kind::Executable => {
                 if let Some(parent) = path.parent() {
@@ -268,7 +282,39 @@ async fn receive_into(
             }
         }
     }
+    for (_, target, path) in links {
+        // An earlier link with a name that only looks different would lead elsewhere
+        if through_link(partial, &path).await {
+            return Err("unsafe link".into());
+        }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        }
+        // Windows makes links only for administrators: left out there
+        #[cfg(unix)]
+        tokio::fs::symlink(&target, &path).await.map_err(|e| e.to_string())?;
+        #[cfg(not(unix))]
+        let _ = target;
+    }
     Ok(roots)
+}
+
+/// Whether a folder on the way from `base` to `path` is a link.
+async fn through_link(base: &Path, path: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(base) else {
+        return true;
+    };
+    let mut at = base.to_path_buf();
+    let mut parts: Vec<_> = rest.components().collect();
+    parts.pop();
+    for part in parts {
+        at.push(part);
+        match tokio::fs::symlink_metadata(&at).await {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Cancel switches of running transfers.
@@ -290,5 +336,91 @@ impl Cancels {
 
     pub fn finished(&mut self, id: u64) {
         self.0.remove(&id);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::files::Entry;
+
+    fn stream(entries: &[(&str, Kind, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (path, kind, content) in entries {
+            out.extend(files::encode_entry(&Entry {
+                path: path.to_string(),
+                kind: kind.clone(),
+                size: content.len() as u64,
+            }));
+            out.extend_from_slice(content);
+        }
+        out
+    }
+
+    async fn receive_bytes(bytes: &[u8], dir: &Path) -> Result<Vec<String>, String> {
+        let mut source = bytes;
+        let mut progress = Progress::new(|_| {});
+        receive_into(&mut source, &dir.join("part"), &AtomicBool::new(false), &mut progress).await
+    }
+
+    fn fresh(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tablecross-transfer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn links_arrive_after_the_files() {
+        let dir = fresh("links");
+        let bytes = stream(&[
+            ("Tool", Kind::Dir, b""),
+            ("Tool/start", Kind::Link("bin/run".into()), b""),
+            ("Tool/bin/run", Kind::Executable, b"#!/bin/sh\n"),
+        ]);
+        receive_bytes(&bytes, &dir).await.unwrap();
+        let link = dir.join("part/Tool/start");
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("bin/run"));
+        assert_eq!(std::fs::read(&link).unwrap(), b"#!/bin/sh\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_written_through_a_link_that_only_looks_different() {
+        let dir = fresh("through");
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        // `L` points at its own folder: every `l/` after it adds a level that is not there. On a file
+        // system that ignores case, the second link would then reach far above the part folder
+        let bytes = stream(&[
+            ("a", Kind::Dir, b""),
+            ("a/b", Kind::Dir, b""),
+            ("a/b/L", Kind::Link("../b".into()), b""),
+            ("a/b/l/l/l/l/c/M", Kind::Link("../../../../outside".into()), b""),
+            ("a/b/L/l/l/l/c/m/f", Kind::File, b"x"),
+        ]);
+        let _ = receive_bytes(&bytes, &dir).await;
+        let part = dir.join("part");
+        assert!(!dir.join("outside/f").exists());
+        for entry in walk(&part) {
+            if let Ok(target) = std::fs::canonicalize(&entry) {
+                assert!(
+                    target.starts_with(std::fs::canonicalize(&part).unwrap()),
+                    "{entry:?} leads to {target:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            out.push(path.clone());
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                out.extend(walk(&path));
+            }
+        }
+        out
     }
 }
