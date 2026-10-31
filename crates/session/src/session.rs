@@ -511,7 +511,7 @@ impl Shared {
     }
 
     fn execute(&self, actions: Vec<Action>) {
-        execute(actions, &self.node, self.inject.as_deref());
+        execute(actions, &self.node, &self.engine, self.inject.as_deref());
     }
 
     /// Turns a name or fingerprint prefix from `layout.json` into this machine or a paired one.
@@ -865,8 +865,12 @@ impl Shared {
     }
 }
 
-/// Carries out the engine's actions.
-fn execute(actions: Vec<Action>, node: &Node, inject: Option<&dyn Inject>) {
+/// Carries out the engine's actions. Grabs and ungrabs from different threads can arrive out of
+/// order (a grab still under way while the target already took over): each one happens under the
+/// engine lock and only if it still fits the role, otherwise the capture would keep pulling the
+/// pointer back to its parking spot while nothing controls another computer.
+fn execute(actions: Vec<Action>, node: &Node, engine: &Mutex<Engine>, inject: Option<&dyn Inject>) {
+    let controlling = |engine: &Engine| matches!(engine.role(), Role::Controlling(_));
     for action in actions {
         let result = match (action, inject) {
             (Action::Send { to, message }, _) => {
@@ -875,8 +879,24 @@ fn execute(actions: Vec<Action>, node: &Node, inject: Option<&dyn Inject>) {
                 }
                 Ok(())
             }
-            (Action::Grab { park }, Some(inject)) => inject.grab(park),
-            (Action::Ungrab { at }, Some(inject)) => inject.ungrab(at),
+            (Action::Grab { park }, Some(inject)) => {
+                let engine = engine.lock().expect("engine lock");
+                if controlling(&engine) {
+                    inject.grab(park)
+                } else {
+                    tracing::info!("a grab came too late: control is already back here");
+                    Ok(())
+                }
+            }
+            (Action::Ungrab { at }, Some(inject)) => {
+                let engine = engine.lock().expect("engine lock");
+                if controlling(&engine) {
+                    tracing::info!("an ungrab came too late: another computer is controlled again");
+                    Ok(())
+                } else {
+                    inject.ungrab(at)
+                }
+            }
             (Action::Inject(message), Some(inject)) => inject.inject(&message),
             (_, None) => Ok(()),
         };
@@ -1055,7 +1075,7 @@ fn handler(shared: Arc<Shared>) -> tc_input::Handler {
         {
             drag_on(&shared, &mut actions);
         }
-        execute(actions, &shared.node, shared.inject.as_deref());
+        execute(actions, &shared.node, &shared.engine, shared.inject.as_deref());
         // Announced only now: the pointer must arrive over there before the files do
         if !dropped.is_empty() {
             let _ = shared.internal.send(Internal::Dropped(dropped));
