@@ -5,7 +5,7 @@
 //! - macOS: Text Input Sources (keyboard layouts and input methods that can be selected), on the
 //!   main thread as the system demands. Without a main run loop (command line) nothing happens.
 //! - Windows: the layout of the window in front, switched through `WM_INPUTLANGCHANGEREQUEST`.
-//! - Linux: not yet.
+//! - Linux: not yet (X11 at least types like the local keyboard, see `linux.rs`).
 
 pub use tc_protocol::KeyboardLayout;
 

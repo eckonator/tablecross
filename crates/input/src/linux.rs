@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tc_core::{Captured, Point};
 use tc_protocol::{Message, MouseButton, PressedKeys, Screen};
@@ -44,6 +45,8 @@ struct InjectState {
     buttons: Vec<MouseButton>,
     wheel_rest: (f64, f64),
     cursor_hidden: bool,
+    /// When the keyboard map of the XTest keyboard was last compared with the real one.
+    keymap_checked: Option<Instant>,
 }
 
 fn connect() -> Result<(RustConnection, Window), InputError> {
@@ -75,12 +78,118 @@ pub fn backend() -> Result<Backend, InputError> {
             buttons: Vec::new(),
             wheel_rest: (0.0, 0.0),
             cursor_hidden: false,
+            keymap_checked: Some(Instant::now()),
         }),
     });
+    xtest_keymap::follow_in_background();
     Ok(Backend {
         capture: Box::new(X11Capture { shared: shared.clone() }),
         inject: Arc::new(X11Inject { shared }),
     })
+}
+
+/// How often the keyboard map of the XTest keyboard is compared with the real one, at most.
+const KEYMAP_CHECK: Duration = Duration::from_secs(10);
+
+/// Injected keys take the keyboard map of the XTest keyboard. The layout chosen for the system
+/// (Debian: `/etc/default/keyboard`, applied by udev to real keyboards only) does not reach it, so
+/// it would type as US English. Its map is set to the one of the real keyboard with `xkbcomp`,
+/// which comes with every X server.
+mod xtest_keymap {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use x11rb::protocol::xinput::{ConnectionExt as _, DeviceType};
+
+    /// The map last given to the XTest keyboard, and whether a thread is at it.
+    static APPLIED: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+    static BUSY: AtomicBool = AtomicBool::new(false);
+
+    pub fn follow_in_background() {
+        if BUSY.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = std::thread::Builder::new().name("tablecross-keymap".into()).spawn(|| {
+            if let Err(e) = follow() {
+                tracing::warn!("injected keys may not follow the keyboard layout: {e}");
+            }
+            BUSY.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn follow() -> Result<(), String> {
+        let (conn, _) = super::connect().map_err(|e| e.to_string())?;
+        let infos = conn
+            .xinput_xi_query_device(0u16)
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map_err(|e| e.to_string())?
+            .infos;
+        let devices: Vec<_> = infos
+            .iter()
+            .map(|d| {
+                (
+                    d.deviceid,
+                    d.type_,
+                    d.attachment,
+                    String::from_utf8_lossy(&d.name).into_owned(),
+                )
+            })
+            .collect();
+        let Some((from, to)) = pick(&devices) else {
+            return Ok(());
+        };
+        let map = xkbcomp(&["-w", "0", "-xkb", "-i", &from.to_string(), &display(), "-"], None)?;
+        let mut applied = APPLIED.lock().expect("keymap lock");
+        if applied.as_ref() == Some(&map) {
+            return Ok(());
+        }
+        xkbcomp(&["-w", "0", "-i", &to.to_string(), "-", &display()], Some(&map))?;
+        tracing::info!("injected keys type like keyboard {from}: its map was given to the XTest keyboard {to}");
+        *applied = Some(map);
+        Ok(())
+    }
+
+    fn display() -> String {
+        std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into())
+    }
+
+    fn xkbcomp(args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        let mut child = Command::new("xkbcomp")
+            .args(args)
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("xkbcomp: {e}"))?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(input).map_err(|e| format!("xkbcomp: {e}"))?;
+        }
+        let out = child.wait_with_output().map_err(|e| format!("xkbcomp: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "xkbcomp failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(out.stdout)
+    }
+
+    /// The real keyboard whose map to take and the XTest keyboard of the same master keyboard:
+    /// from `(id, type, master, name)`. One called a keyboard beats buttons and hotkeys.
+    pub(super) fn pick(devices: &[(u16, DeviceType, u16, String)]) -> Option<(u16, u16)> {
+        let slaves = || devices.iter().filter(|d| d.1 == DeviceType::SLAVE_KEYBOARD);
+        let xtest = |d: &&(u16, DeviceType, u16, String)| d.3.contains("XTEST");
+        let to = slaves().find(xtest)?;
+        let real: Vec<_> = slaves().filter(|d| !xtest(d) && d.2 == to.2).collect();
+        let from = real
+            .iter()
+            .find(|d| d.3.to_lowercase().contains("keyboard"))
+            .or(real.first())?;
+        Some((from.0, to.0))
+    }
 }
 
 pub struct X11Capture {
@@ -320,6 +429,11 @@ impl InjectState {
         };
         if !changed {
             return;
+        }
+        if down && self.keymap_checked.is_none_or(|t| t.elapsed() > KEYMAP_CHECK) {
+            // Someone starts typing: the layout may have changed since
+            self.keymap_checked = Some(Instant::now());
+            xtest_keymap::follow_in_background();
         }
         let kind = if down {
             xproto::KEY_PRESS_EVENT
@@ -576,6 +690,22 @@ mod raw_tests {
 
     fn fp(v: i32) -> xinput::Fp3232 {
         xinput::Fp3232 { integral: v, frac: 0 }
+    }
+
+    #[test]
+    fn the_xtest_keyboard_takes_the_map_of_a_real_keyboard() {
+        use xinput::DeviceType as T;
+        let d = |id, t, master, name: &str| (id, t, master, name.to_string());
+        let devices = [
+            d(3, T::MASTER_KEYBOARD, 2, "Virtual core keyboard"),
+            d(5, T::SLAVE_KEYBOARD, 3, "Virtual core XTEST keyboard"),
+            d(6, T::SLAVE_KEYBOARD, 3, "Power Button"),
+            d(9, T::SLAVE_KEYBOARD, 3, "AT Translated Set 2 keyboard"),
+            d(4, T::SLAVE_POINTER, 2, "Virtual core XTEST pointer"),
+        ];
+        assert_eq!(xtest_keymap::pick(&devices), Some((9, 5)));
+        assert_eq!(xtest_keymap::pick(&devices[..3]), Some((6, 5)));
+        assert_eq!(xtest_keymap::pick(&devices[..2]), None);
     }
 
     #[test]
