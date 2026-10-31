@@ -43,6 +43,11 @@ jobs:
           - os: ubuntu-22.04-arm
             name: Linux-arm64
             arch: arm64
+          # 32-bit PCs (e.g. netbooks with an Atom CPU), cross-built on the 64-bit runner
+          - os: ubuntu-22.04
+            name: Linux-i686
+            arch: i686
+            target: i686-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -50,7 +55,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.name == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.name == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target || '' }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -60,9 +65,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
             libxrandr-dev libxi-dev libgl1-mesa-dev pkg-config
+          # The C parts (ring) for 32 bits; the system libraries are loaded at run time
+          if [ -n "${{ matrix.target }}" ]; then sudo apt-get install -y gcc-multilib; fi
 
       - name: Tests
-        run: cargo test --workspace --release
+        shell: bash
+        run: cargo test --workspace --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Licenses of the libraries
         shell: bash
@@ -127,11 +135,13 @@ jobs:
       - name: Linux
         if: runner.os == 'Linux'
         run: |
-          cargo build --release -p tablecross -p tablecross-cli
+          T="${{ matrix.target }}"
+          cargo build --release -p tablecross -p tablecross-cli ${T:+--target $T}
+          OUT="target/${T:+$T/}release"
           V="${{ steps.version.outputs.version }}"
           DIR="TableCross-$V-Linux-${{ matrix.arch }}"
           mkdir -p "pkg/$DIR"
-          cp target/release/tablecross target/release/tablecross-cli assets/tablecross.desktop \
+          cp "$OUT/tablecross" "$OUT/tablecross-cli" assets/tablecross.desktop \
             README.md LICENSE THIRD-PARTY-LICENSES.yml assets/fonts/*-LICENSE.txt "pkg/$DIR/"
           cp assets/icon-256.png "pkg/$DIR/tablecross.png"
           cp scripts/install-linux.sh "pkg/$DIR/install.sh"
@@ -171,7 +181,7 @@ jobs:
           prerelease: false
           make_latest: true
           body: |
-            TableCross ${{ steps.version.outputs.version }} for macOS (Apple silicon and Intel, one universal app), Windows (64-bit) and Linux (x86_64 and arm64, e.g. Raspberry Pi 4/5 with 64-bit Raspberry Pi OS).
+            TableCross ${{ steps.version.outputs.version }} for macOS (Apple silicon and Intel, one universal app), Windows (64-bit) and Linux (x86_64, arm64, e.g. Raspberry Pi 4/5 with 64-bit Raspberry Pi OS, and 32-bit i686).
 
             **macOS:** open the `.dmg` and drag TableCross to Applications. On first start macOS refuses it once: click Done, then System Settings → Privacy & Security → **Open Anyway**. Or install from Terminal without that step:
             ```

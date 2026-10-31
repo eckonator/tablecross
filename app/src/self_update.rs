@@ -35,6 +35,8 @@ pub fn asset_suffix() -> Option<&'static str> {
     } else if cfg!(target_os = "linux") {
         let arch = if cfg!(target_arch = "aarch64") {
             "-Linux-arm64.tar.gz"
+        } else if cfg!(target_arch = "x86") {
+            "-Linux-i686.tar.gz"
         } else {
             "-Linux-x86_64.tar.gz"
         };

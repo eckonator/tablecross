@@ -63,7 +63,7 @@ outright, with no “Run anyway”; TableCross is not signed, the `.zip` neither
 to switch Smart App Control off (Windows Security → App & browser control → Smart App Control).
 Windows cannot switch it on again afterwards without being reset, so decide with care.
 
-**Linux** (X11, or Wayland on GNOME 45+ / KDE Plasma 6.1+), x86_64 or arm64: unpack the `.tar.gz` and
+**Linux** (X11, or Wayland on GNOME 45+ / KDE Plasma 6.1+), x86_64, arm64 or 32-bit (`i686`): unpack the `.tar.gz` and
 run `./install.sh` (installs for the current user; `./install.sh --uninstall` removes it). GNOME shows
 the TableCross symbol and its menu only with the AppIndicator extension (Debian/Ubuntu:
 `sudo apt install gnome-shell-extension-appindicator`, then log out and in and switch it on in
