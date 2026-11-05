@@ -256,7 +256,32 @@ async fn pair(a: &Machine, b: &Machine) {
             .iter()
             .any(|p| p.fingerprint == other.node.fingerprint() && p.link.is_some())
     };
-    until("connected", || linked(a, b) && linked(b, a)).await;
+    for _ in 0..2000 {
+        if linked(a, b) && linked(b, a) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // What each side knows, for a failure that only happens now and then on CI machines
+    let state = |m: &Machine| {
+        let status = m.session.status();
+        let peers: Vec<_> = status
+            .peers
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} link {:?} reconnects {} refusal {:?}",
+                    p.name, p.link, p.reconnects, p.refusal
+                )
+            })
+            .collect();
+        format!(
+            "pairing {:?}, busy {}, peers {peers:?}",
+            status.pairing.is_some(),
+            status.pairing_busy
+        )
+    };
+    panic!("not reached: connected\nA: {}\nB: {}", state(a), state(b));
 }
 
 async fn paired_pair(a_name: &str, b_name: &str) -> (Machine, Machine) {

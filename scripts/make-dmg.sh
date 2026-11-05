@@ -16,5 +16,14 @@ ditto "$APP" "$STAGE/TableCross.app"
 ln -s /Applications "$STAGE/Applications"
 cp README.md LICENSE assets/fonts/*-LICENSE.txt "$STAGE/"
 rm -f "$OUT"
-hdiutil create -quiet -volname "TableCross $VERSION" -srcfolder "$STAGE" -format UDZO "$OUT"
+# hdiutil fails now and then on CI runners ("Resource busy"): try again a few times
+for attempt in 1 2 3 4 5; do
+  if hdiutil create -volname "TableCross $VERSION" -srcfolder "$STAGE" -format UDZO "$OUT"; then
+    break
+  fi
+  [ "$attempt" -lt 5 ] || { echo "hdiutil failed $attempt times" >&2; exit 1; }
+  echo "hdiutil failed, trying again (attempt $attempt)" >&2
+  rm -f "$OUT"
+  sleep $((attempt * 5))
+done
 echo "Done: $OUT"
