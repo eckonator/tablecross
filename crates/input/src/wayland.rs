@@ -436,6 +436,9 @@ const SWITCHED_OFF_WINDOW: Duration = Duration::from_secs(60);
 /// The compositor takes injected motion for a push against a barrier as well: an activation this
 /// soon after moving the pointer for another computer came from there, not from the user.
 const INJECTED_LATELY: Duration = Duration::from_millis(500);
+/// Barriers change only after the sides stayed the same this long (and as long after capturing
+/// was switched on).
+const SIDES_SETTLE: Duration = Duration::from_millis(1500);
 /// A session the system ended is opened anew after this pause, and at most this often.
 const REOPEN_AFTER: Duration = Duration::from_secs(3);
 const REOPEN_AT_MOST_EVERY: Duration = Duration::from_secs(60);
@@ -897,6 +900,10 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
     // A lost session is opened anew after a pause (and at most once a minute: it may ask again)
     let mut reopen: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut reopened: Option<Instant> = None;
+    // Changed sides wait until they settle: switching capturing off and on in quick succession
+    // crashed GNOME Shell once (right after it was switched on)
+    let mut pending_sides: Option<Vec<Side>> = None;
+    let mut sides_due: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     loop {
         if receiver.as_ref().is_some_and(|r| r.lost) && reopen.is_none() {
             let wait = match reopened {
@@ -915,6 +922,12 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
             reopen = Some(Box::pin(tokio::time::sleep(wait)));
         }
         tokio::select! {
+            () = async { match sides_due.as_mut() { Some(s) => s.await, None => std::future::pending().await } } => {
+                sides_due = None;
+                if let (Some(r), Some(sides)) = (receiver.as_mut(), pending_sides.take()) {
+                    r.set_sides(sides).await;
+                }
+            }
             () = async { match reopen.as_mut() { Some(s) => s.await, None => std::future::pending().await } } => {
                 reopen = None;
                 reopened = Some(Instant::now());
@@ -925,6 +938,9 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
                     match open_receiver(handler, sides).await {
                         Ok((r, events)) => {
                             receiver = Some(r);
+                            if pending_sides.is_some() {
+                                sides_due = Some(Box::pin(tokio::time::sleep(SIDES_SETTLE)));
+                            }
                             receiver_events = Some(events);
                             shared.capturing.store(true, Ordering::SeqCst);
                         }
@@ -969,6 +985,9 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
                                     }
                                 }
                                 receiver = Some(r);
+                            if pending_sides.is_some() {
+                                sides_due = Some(Box::pin(tokio::time::sleep(SIDES_SETTLE)));
+                            }
                                 receiver_events = Some(events);
                                 shared.capturing.store(true, Ordering::SeqCst);
                             }
@@ -990,9 +1009,8 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
                         shared.capturing.store(false, Ordering::SeqCst);
                     }
                     Cmd::Sides(sides) => {
-                        if let Some(r) = receiver.as_mut() {
-                            r.set_sides(sides).await;
-                        }
+                        pending_sides = Some(sides);
+                        sides_due = Some(Box::pin(tokio::time::sleep(SIDES_SETTLE)));
                     }
                     Cmd::Inject(message) => {
                         if let Some(sender) = sender.as_mut() {
