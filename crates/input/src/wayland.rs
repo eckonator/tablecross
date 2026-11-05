@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ashpd::desktop::input_capture::{
-    Activated, Barrier, Capabilities, ConnectToEISOptions as CaptureEisOptions,
+    Activated, Barrier, Capabilities, ConnectToEISOptions as CaptureEisOptions, CreateSession2Options,
     CreateSessionOptions as CaptureSessionOptions, DisableOptions, EnableOptions, GetZonesOptions, InputCapture,
-    ReleaseOptions, SetPointerBarriersOptions,
+    ReleaseOptions, SetPointerBarriersOptions, StartOptions as CaptureStartOptions,
 };
 use ashpd::desktop::remote_desktop::{
     ConnectToEISOptions, DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
@@ -101,12 +101,25 @@ fn now_us() -> u64 {
         .map_or(0, |d| d.as_micros() as u64)
 }
 
-/// Where the RemoteDesktop permission is remembered.
-fn token_file() -> Option<PathBuf> {
+/// Where the permission of a portal is remembered (`remote-desktop`, `input-capture`).
+fn token_file(portal: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("tablecross/remote-desktop-token"))
+    Some(base.join(format!("tablecross/{portal}-token")))
+}
+
+fn read_token(portal: &str) -> Option<String> {
+    token_file(portal).and_then(|f| std::fs::read_to_string(f).ok())
+}
+
+fn save_token(portal: &str, token: Option<&str>) {
+    if let (Some(token), Some(file)) = (token, token_file(portal)) {
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(file, token);
+    }
 }
 
 /// Injecting through the RemoteDesktop portal.
@@ -120,12 +133,13 @@ struct Sender {
     position: Option<(f32, f32)>,
     /// Top left corner of all screens (where a relative pointer is pushed to at first).
     origin: (f32, f32),
+    screens: Vec<Screen>,
 }
 
 async fn open_sender() -> Result<(Sender, reis::tokio::EiConvertEventStream, Session<RemoteDesktop>), ashpd::Error> {
     let portal = RemoteDesktop::new().await?;
     let session = portal.create_session(CreateSessionOptions::default()).await?;
-    let token = token_file().and_then(|f| std::fs::read_to_string(f).ok());
+    let token = read_token("remote-desktop");
     portal
         .select_devices(
             &session,
@@ -139,12 +153,7 @@ async fn open_sender() -> Result<(Sender, reis::tokio::EiConvertEventStream, Ses
         .start(&session, None, StartOptions::default())
         .await?
         .response()?;
-    if let (Some(token), Some(file)) = (started.restore_token(), token_file()) {
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(file, token);
-    }
+    save_token("remote-desktop", started.restore_token());
     let fd = portal.connect_to_eis(&session, ConnectToEISOptions::default()).await?;
     let context = ei::Context::new(UnixStream::from(fd)).map_err(ashpd::Error::IO)?;
     let (connection, events) = context
@@ -161,6 +170,7 @@ async fn open_sender() -> Result<(Sender, reis::tokio::EiConvertEventStream, Ses
             buttons: Vec::new(),
             position: None,
             origin: (0.0, 0.0),
+            screens: Vec::new(),
         },
         events,
         session,
@@ -232,6 +242,18 @@ impl Sender {
                     if let Some(pointer) = device.interface::<ei::PointerAbsolute>() {
                         pointer.motion_absolute(x, y);
                         self.frame(device);
+                    }
+                    // A position cannot push against the edge of the screens; relative motion can
+                    // (a dock that shows on pressure against the bottom edge)
+                    if let Message::MouseMove { dx, dy, .. } = *message {
+                        let (px, py) = beyond_edge(&self.screens, x, y, dx, dy);
+                        if (px != 0.0 || py != 0.0)
+                            && let Some(device) = self.device(DeviceCapability::Pointer)
+                            && let Some(pointer) = device.interface::<ei::Pointer>()
+                        {
+                            pointer.motion_relative(px, py);
+                            self.frame(device);
+                        }
                     }
                 } else if let Some(device) = self.device(DeviceCapability::Pointer) {
                     // Only relative motion offered: move by the difference. Where the pointer is
@@ -337,6 +359,32 @@ impl Sender {
             self.inject(&Message::MouseButton { button, down: false });
         }
     }
+}
+
+/// The part of the motion `(dx, dy)` at `(x, y)` that pushes over an outer edge of the screens.
+fn beyond_edge(screens: &[Screen], x: f32, y: f32, dx: f32, dy: f32) -> (f32, f32) {
+    let on = |x: f32, y: f32| {
+        screens.iter().any(|s| {
+            x >= s.x as f32
+                && x < (s.x + s.width as i32) as f32
+                && y >= s.y as f32
+                && y < (s.y + s.height as i32) as f32
+        })
+    };
+    if !on(x, y) {
+        return (0.0, 0.0);
+    }
+    let px = if (dx < 0.0 && !on(x - 1.0, y)) || (dx > 0.0 && !on(x + 1.0, y)) {
+        dx
+    } else {
+        0.0
+    };
+    let py = if (dy < 0.0 && !on(x, y - 1.0)) || (dy > 0.0 && !on(x, y + 1.0)) {
+        dy
+    } else {
+        0.0
+    };
+    (px, py)
 }
 
 /// Capturing through the InputCapture portal.
@@ -471,12 +519,35 @@ async fn open_receiver(
     sides: Vec<Side>,
 ) -> Result<(Receiver, reis::tokio::EiConvertEventStream), ashpd::Error> {
     let portal = InputCapture::new().await?;
-    let (session, _) = portal
-        .create_session(
-            None,
-            CaptureSessionOptions::default().set_capabilities(Capabilities::Keyboard | Capabilities::Pointer),
-        )
-        .await?;
+    let capabilities = Capabilities::Keyboard | Capabilities::Pointer;
+    // Version 2 of the portal remembers the permission; version 1 asks at every start
+    let session = match portal.create_session2(CreateSession2Options::default()).await {
+        Ok(session) => {
+            let options = CaptureStartOptions::default()
+                .set_capabilities(capabilities)
+                .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                .set_restore_token(read_token("input-capture"));
+            let started = portal.start(&session, None, options).await?.response()?;
+            save_token("input-capture", started.restore_token());
+            tracing::info!(
+                "input capture started, the permission is {}",
+                if started.restore_token().is_some() {
+                    "remembered"
+                } else {
+                    "not remembered"
+                }
+            );
+            session
+        }
+        Err(ashpd::Error::RequiresVersion(_, current)) => {
+            tracing::info!("input capture portal version {current}: it asks for permission at every start");
+            portal
+                .create_session(None, CaptureSessionOptions::default().set_capabilities(capabilities))
+                .await?
+                .0
+        }
+        Err(e) => return Err(e),
+    };
     let zones_reply = portal.zones(&session, GetZonesOptions::default()).await?.response()?;
     let zones: Vec<_> = zones_reply
         .regions()
@@ -868,6 +939,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
                             if screens.is_empty() {
                                 sender.origin = (0.0, 0.0);
                             }
+                            sender.screens.clone_from(&screens);
                             drop(screens);
                             sender.inject(&message);
                         }
@@ -1015,6 +1087,33 @@ mod tests {
         assert!(positions.contains(&(3200, 0, 3200, 1023)));
         assert!(!positions.contains(&(1920, 0, 1920, 1079)));
         assert!(positions.contains(&(0, 1080, 1919, 1080)));
+    }
+
+    #[test]
+    fn only_motion_over_an_outer_edge_pushes() {
+        let screens = [
+            Screen {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900,
+                scale: 1.0,
+            },
+            Screen {
+                x: 1440,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale: 1.0,
+            },
+        ];
+        // Down and right along the bottom: only the push down counts
+        assert_eq!(beyond_edge(&screens, 700.0, 899.0, 3.0, 5.0), (0.0, 5.0));
+        // In the middle, and toward the other screen
+        assert_eq!(beyond_edge(&screens, 700.0, 400.0, 3.0, 5.0), (0.0, 0.0));
+        assert_eq!(beyond_edge(&screens, 1439.0, 400.0, 4.0, 0.0), (0.0, 0.0));
+        // The top left corner
+        assert_eq!(beyond_edge(&screens, 0.0, 0.0, -2.0, -3.0), (-2.0, -3.0));
     }
 
     #[test]

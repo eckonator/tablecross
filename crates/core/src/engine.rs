@@ -923,7 +923,9 @@ impl Engine {
 
     fn set_position(&mut self, target: &str, pos: Point, lx: f64, ly: f64, actions: &mut Vec<Action>) {
         if let Mode::Remote { pos: current, .. } = &mut self.mode {
-            if *current == pos {
+            // Pushing against an edge still goes over: the target may show something there (a
+            // dock that wants pressure against the edge)
+            if *current == pos && lx == 0.0 && ly == 0.0 {
                 return;
             }
             *current = pos;
