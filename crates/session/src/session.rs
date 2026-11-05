@@ -1335,6 +1335,7 @@ async fn run(
     let mut screen_tick = tokio::time::interval(Duration::from_secs(2));
     let mut clip_tick = tokio::time::interval(Duration::from_millis(300));
     let mut log_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut open_sides: Option<Vec<Side>> = None;
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -1431,6 +1432,14 @@ async fn run(
             _ = tick.tick() => {
                 let actions = shared.engine.lock().expect("engine lock").tick();
                 shared.execute(actions);
+                let open = shared.engine.lock().expect("engine lock").open_sides();
+                if open_sides.as_ref() != Some(&open) {
+                    tracing::info!("the pointer can leave over these edges: {open:?}");
+                    if let Some(capture) = capture.as_ref() {
+                        capture.open_sides(&open);
+                    }
+                    open_sides = Some(open);
+                }
                 let now = shared.engine.lock().expect("engine lock").role();
                 if now != role {
                     let arrived = matches!(now, Role::ControlledBy(_))

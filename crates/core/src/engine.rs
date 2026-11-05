@@ -346,6 +346,24 @@ impl Engine {
         self.layout = layout;
     }
 
+    /// The sides of this machine the pointer can leave over: a machine that is online lies beyond
+    /// them somewhere along the edge (past ones that are not, if allowed).
+    pub fn open_sides(&self) -> Vec<Side> {
+        let online = |m: &str| self.machines.contains_key(m);
+        [Side::Left, Side::Right, Side::Top, Side::Bottom]
+            .into_iter()
+            .filter(|&side| {
+                self.online_neighbor(&self.me, side).is_some()
+                    || (0..=20).any(|i| {
+                        let along = f64::from(i) / 20.0;
+                        self.layout
+                            .across_online(&self.me, side, along, self.skip_offline, online)
+                            .is_some()
+                    })
+            })
+            .collect()
+    }
+
     pub fn set_local_screens(&mut self, screens: &[Screen]) {
         match Screens::new(screens) {
             Some(s) => self.machines.insert(self.me.clone(), s),

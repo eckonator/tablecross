@@ -552,6 +552,31 @@ fn a_computer_that_is_away_is_skipped() {
 }
 
 #[test]
+fn only_edges_with_a_computer_online_behind_them_are_open() {
+    let mut sim = Sim::new(
+        &[
+            ("book", vec![screen(0, 0, 1000, 800, 1.0)]),
+            ("middle", vec![screen(0, 0, 1000, 800, 1.0)]),
+            ("imac", vec![screen(0, 0, 2000, 1000, 1.0)]),
+        ],
+        Layout::default()
+            .with("middle", Side::Right, "book")
+            .with("imac", Side::Right, "middle"),
+    );
+    let open = |sim: &Sim, m: &str| sim.machines[m].engine.open_sides();
+    assert_eq!(open(&sim, "book"), vec![Side::Right]);
+    assert_eq!(open(&sim, "middle"), vec![Side::Left, Side::Right]);
+    sim.disconnect("book", "middle");
+    // Past the one that is away
+    assert_eq!(open(&sim, "book"), vec![Side::Right]);
+    sim.machines.get_mut("book").unwrap().engine.set_skip_offline(false);
+    assert!(open(&sim, "book").is_empty());
+    // Alone on the desk
+    let alone = Engine::new("solo", &[screen(0, 0, 1440, 900, 1.0)], Layout::default());
+    assert!(alone.open_sides().is_empty());
+}
+
+#[test]
 fn cmd_and_ctrl_can_be_swapped_per_target() {
     let mut layout = Layout::default().with("pc", Side::Right, "mac");
     layout.swap_cmd_ctrl.insert("pc".into());

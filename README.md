@@ -67,7 +67,7 @@ Windows cannot switch it on again afterwards without being reset, so decide with
 run `./install.sh` (installs for the current user; `./install.sh --uninstall` removes it). GNOME shows
 the TableCross symbol and its menu only with the AppIndicator extension (Debian/Ubuntu:
 `sudo apt install gnome-shell-extension-appindicator`, then log out and in and switch it on in
-**Extensions**).
+**Extensions**). Without it, quit TableCross with `pkill -x tablecross` in a terminal.
 
 **Raspberry Pi 4/5** (64-bit Raspberry Pi OS): use the `arm64` archive. The default desktop (labwc or
 Wayfire on Wayland) offers no way for programs to read or send input, so switch to X11 in

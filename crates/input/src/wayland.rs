@@ -31,7 +31,7 @@ use futures_util::StreamExt;
 use futures_util::stream::LocalBoxStream;
 use reis::ei;
 use reis::event::{Device, DeviceCapability, EiEvent};
-use tc_core::{Captured, Point};
+use tc_core::{Captured, Point, Side};
 use tc_protocol::{Message, MouseButton, PressedKeys, Screen};
 use tokio::sync::mpsc;
 
@@ -50,6 +50,8 @@ const DETENT: f32 = 120.0;
 enum Cmd {
     StartCapture(Handler),
     Inject(Message),
+    StopCapture,
+    Sides(Vec<Side>),
     Grab,
     Ungrab(Point),
     ReleaseAll,
@@ -61,6 +63,8 @@ struct Shared {
     grabbed: AtomicBool,
     capturing: AtomicBool,
     problems: Mutex<Vec<Problem>>,
+    /// Where a computer lies beyond: only these sides get barriers.
+    sides: Mutex<Vec<Side>>,
 }
 
 pub fn backend() -> Result<Backend, InputError> {
@@ -353,6 +357,12 @@ struct Receiver {
     own_change: Instant,
     /// When the system switched capturing off lately: if it keeps doing so, it is meant.
     switched_off: Vec<Instant>,
+    sides: Vec<Side>,
+    /// The barriers have to be set anew once the pointer is given back.
+    refresh_later: bool,
+    /// Since when input comes over EI that no computer takes (the activation was missed, or giving
+    /// the pointer back failed): the compositor holds the pointer for nobody.
+    unwanted_since: Option<Instant>,
 }
 
 /// How long after changing the barriers a "Disabled" signal is taken for its echo.
@@ -363,9 +373,11 @@ const SETTLE_AFTER_DISABLED: Duration = Duration::from_secs(1);
 /// Switched off this often within `SWITCHED_OFF_WINDOW`, capturing stays off.
 const SWITCHED_OFF_LIMIT: usize = 5;
 const SWITCHED_OFF_WINDOW: Duration = Duration::from_secs(60);
+/// Input over EI that no computer takes for this long: the pointer is given back.
+const UNWANTED_FOR: Duration = Duration::from_millis(500);
 
-/// Barriers on every zone edge that has no other zone behind it.
-fn barriers(zones: &[(i32, i32, i32, i32)]) -> Vec<Barrier> {
+/// Barriers on every zone edge on one of `sides` that has no other zone behind it.
+fn barriers(zones: &[(i32, i32, i32, i32)], sides: &[Side]) -> Vec<Barrier> {
     let touches = |a: &(i32, i32, i32, i32), b: &(i32, i32, i32, i32), side: u8| {
         let (ax, ay, aw, ah) = *a;
         let (bx, by, bw, bh) = *b;
@@ -382,6 +394,10 @@ fn barriers(zones: &[(i32, i32, i32, i32)]) -> Vec<Barrier> {
     for (i, zone) in zones.iter().enumerate() {
         let (x, y, w, h) = *zone;
         for side in 0..4u8 {
+            let facing = [Side::Left, Side::Right, Side::Top, Side::Bottom][usize::from(side)];
+            if !sides.contains(&facing) {
+                continue;
+            }
             if zones
                 .iter()
                 .enumerate()
@@ -445,7 +461,10 @@ fn pushed_out(zones: &[(i32, i32, i32, i32)], x: f64, y: f64) -> (f64, f64, f64,
     }
 }
 
-async fn open_receiver(handler: Handler) -> Result<(Receiver, reis::tokio::EiConvertEventStream), ashpd::Error> {
+async fn open_receiver(
+    handler: Handler,
+    sides: Vec<Side>,
+) -> Result<(Receiver, reis::tokio::EiConvertEventStream), ashpd::Error> {
     let portal = InputCapture::new().await?;
     let (session, _) = portal
         .create_session(
@@ -459,10 +478,11 @@ async fn open_receiver(handler: Handler) -> Result<(Receiver, reis::tokio::EiCon
         .iter()
         .map(|r| (r.x_offset(), r.y_offset(), r.width() as i32, r.height() as i32))
         .collect();
+    let barriers = barriers(&zones, &sides);
     portal
         .set_pointer_barriers(
             &session,
-            &barriers(&zones),
+            &barriers,
             zones_reply.zone_set(),
             SetPointerBarriersOptions::default(),
         )
@@ -474,7 +494,12 @@ async fn open_receiver(handler: Handler) -> Result<(Receiver, reis::tokio::EiCon
         .handshake_tokio("tablecross", ei::handshake::ContextType::Receiver)
         .await
         .map_err(|e| ashpd::Error::IO(std::io::Error::other(e.to_string())))?;
-    portal.enable(&session, EnableOptions::default()).await?;
+    // Without a barrier capturing stays off: nothing to hit, nothing held
+    let enabled = !barriers.is_empty();
+    if enabled {
+        portal.enable(&session, EnableOptions::default()).await?;
+    }
+    tracing::info!("input capture ready, barriers on {sides:?} of {zones:?}");
     Ok((
         Receiver {
             portal,
@@ -485,9 +510,12 @@ async fn open_receiver(handler: Handler) -> Result<(Receiver, reis::tokio::EiCon
             active: false,
             park: (0.0, 0.0),
             handler,
-            enabled: true,
+            enabled,
             own_change: Instant::now() + OWN_CHANGE,
             switched_off: Vec::new(),
+            sides,
+            refresh_later: false,
+            unwanted_since: None,
         },
         events,
     ))
@@ -501,22 +529,97 @@ impl Receiver {
         let (x, y) = (f64::from(at.0), f64::from(at.1));
         let (x, y, dx, dy) = pushed_out(&self.zones, x, y);
         self.park = (x, y);
+        self.unwanted_since = None;
         let _ = (self.handler)(Captured::Motion { x, y, dx, dy });
-        if !shared.grabbed.load(Ordering::SeqCst) {
+        let grabbed = shared.grabbed.load(Ordering::SeqCst);
+        tracing::info!(
+            "the pointer hit an edge at ({x:.0}, {y:.0}), activation {activation:?}, {}",
+            if grabbed { "it goes over" } else { "nothing behind it" }
+        );
+        if !grabbed {
             // No computer behind this edge: give the pointer back at once
             self.release(Some((x, y))).await;
         }
     }
 
+    /// Gives the pointer back to the compositor. If it refuses twice, capturing is switched off,
+    /// which ends the capture as well, and on again with fresh barriers.
     async fn release(&mut self, at: Option<(f64, f64)>) {
-        let options = ReleaseOptions::default()
-            .set_activation_id(self.activation)
-            .set_cursor_position(at);
-        if let Err(e) = self.portal.release(&self.session, options).await {
-            tracing::warn!("cannot release the pointer: {e}");
+        let mut refused = None;
+        for attempt in 0..2 {
+            let options = ReleaseOptions::default()
+                .set_activation_id(self.activation)
+                .set_cursor_position(at);
+            match self.portal.release(&self.session, options).await {
+                Ok(_) => {
+                    refused = None;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("cannot release the pointer (attempt {}): {e}", attempt + 1);
+                    refused = Some(e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
         self.activation = None;
         self.active = false;
+        self.unwanted_since = None;
+        if refused.is_some() {
+            tracing::warn!("switching capturing off to free the pointer");
+            self.refresh_later = false;
+            self.refresh_zones().await;
+        } else if std::mem::take(&mut self.refresh_later) {
+            self.refresh_zones().await;
+        }
+    }
+
+    /// Other computers came or went: barriers only where one is now. While the pointer is
+    /// captured, once it is given back.
+    async fn set_sides(&mut self, sides: Vec<Side>) {
+        if sides == self.sides {
+            return;
+        }
+        self.sides = sides;
+        if self.active {
+            self.refresh_later = true;
+        } else {
+            self.refresh_zones().await;
+        }
+    }
+
+    /// Input came over EI. If no computer takes it for a while, the compositor holds the pointer
+    /// for nobody: give it back.
+    async fn check_wanted(&mut self, shared: &Shared) {
+        if shared.grabbed.load(Ordering::SeqCst) {
+            self.unwanted_since = None;
+            return;
+        }
+        let now = Instant::now();
+        let since = *self.unwanted_since.get_or_insert(now);
+        if now.duration_since(since) >= UNWANTED_FOR {
+            tracing::warn!(
+                "the system holds the pointer, but no computer takes it (activation {:?}): giving it back",
+                self.activation
+            );
+            let at = Some(self.park);
+            self.release(at).await;
+        }
+    }
+
+    /// Capturing ends: the pointer goes back, the barriers away.
+    async fn close(mut self) {
+        if self.active {
+            let at = Some(self.park);
+            self.release(at).await;
+        }
+        if self.enabled
+            && let Err(e) = self.portal.disable(&self.session, DisableOptions::default()).await
+        {
+            tracing::warn!("cannot switch capturing off: {e}");
+        }
+        let _ = self.session.close().await;
+        tracing::info!("input capture stopped");
     }
 
     /// The screens changed: barriers on the new outer edges. Capturing is switched off around it.
@@ -539,23 +642,31 @@ impl Receiver {
                 .iter()
                 .map(|r| (r.x_offset(), r.y_offset(), r.width() as i32, r.height() as i32))
                 .collect();
+            let barriers = barriers(&zones, &self.sides);
             self.portal
                 .set_pointer_barriers(
                     &self.session,
-                    &barriers(&zones),
+                    &barriers,
                     reply.zone_set(),
                     SetPointerBarriersOptions::default(),
                 )
                 .await?
                 .response()?;
             self.zones = zones;
-            self.portal.enable(&self.session, EnableOptions::default()).await?;
-            self.enabled = true;
+            if !barriers.is_empty() {
+                self.portal.enable(&self.session, EnableOptions::default()).await?;
+                self.enabled = true;
+            }
             Ok::<(), ashpd::Error>(())
         }
         .await;
         match result {
-            Ok(()) => tracing::info!("screen edges for capturing renewed: {:?}", self.zones),
+            Ok(()) => tracing::info!(
+                "screen edges for capturing renewed: barriers on {:?} of {:?}{}",
+                self.sides,
+                self.zones,
+                if self.enabled { "" } else { ", capturing stays off" }
+            ),
             Err(e) => tracing::warn!("cannot renew the screen edges for capturing: {e}"),
         }
     }
@@ -567,7 +678,10 @@ impl Receiver {
         if now < self.own_change {
             return;
         }
+        // Switching off ends a capture as well
         self.enabled = false;
+        self.active = false;
+        self.activation = None;
         self.switched_off
             .retain(|at| now.duration_since(*at) < SWITCHED_OFF_WINDOW);
         self.switched_off.push(now);
@@ -580,7 +694,8 @@ impl Receiver {
         self.refresh_zones().await;
     }
 
-    fn event(&mut self, event: EiEvent) {
+    /// Hands input on to the handler; whether it was input (and not housekeeping of EI).
+    fn event(&mut self, event: EiEvent) -> bool {
         let captured = match event {
             EiEvent::SeatAdded(e) => {
                 e.seat.bind_capabilities(
@@ -635,9 +750,11 @@ impl Receiver {
             _ => None,
         };
         let _ = self.connection.flush();
+        let input = captured.is_some();
         if let Some(captured) = captured {
             let _ = (self.handler)(captured);
         }
+        input
     }
 }
 
@@ -680,36 +797,57 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
             command = rx.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    Cmd::StartCapture(handler) => match open_receiver(handler).await {
-                        Ok((r, events)) => {
-                            // Without an absolute pointer the screens come from the capture zones
-                            {
-                                let mut screens = shared.screens.lock().expect("screens lock");
-                                if screens.is_empty() {
-                                    *screens = r
-                                        .zones
-                                        .iter()
-                                        .map(|&(x, y, w, h)| Screen {
-                                            x,
-                                            y,
-                                            width: w.max(0) as u32,
-                                            height: h.max(0) as u32,
-                                            scale: 1.0,
-                                        })
-                                        .collect();
+                    Cmd::StartCapture(handler) => {
+                        if let Some(old) = receiver.take() {
+                            old.close().await;
+                        }
+                        // Listening before capturing is switched on: an activation must not get lost
+                        activated = activations().await;
+                        session_events = session_signals().await;
+                        let sides = shared.sides.lock().expect("sides lock").clone();
+                        match open_receiver(handler, sides).await {
+                            Ok((r, events)) => {
+                                // Without an absolute pointer the screens come from the capture zones
+                                {
+                                    let mut screens = shared.screens.lock().expect("screens lock");
+                                    if screens.is_empty() {
+                                        *screens = r
+                                            .zones
+                                            .iter()
+                                            .map(|&(x, y, w, h)| Screen {
+                                                x,
+                                                y,
+                                                width: w.max(0) as u32,
+                                                height: h.max(0) as u32,
+                                                scale: 1.0,
+                                            })
+                                            .collect();
+                                    }
                                 }
+                                receiver = Some(r);
+                                receiver_events = Some(events);
+                                shared.capturing.store(true, Ordering::SeqCst);
                             }
-                            activated = activations().await;
-                            session_events = session_signals().await;
-                            receiver = Some(r);
-                            receiver_events = Some(events);
-                            shared.capturing.store(true, Ordering::SeqCst);
+                            Err(e) => {
+                                tracing::warn!("no input capture portal: {e}");
+                                shared.problems.lock().expect("problems lock").push(Problem::CaptureStopped);
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!("no input capture portal: {e}");
-                            shared.problems.lock().expect("problems lock").push(Problem::CaptureStopped);
+                    }
+                    Cmd::StopCapture => {
+                        activated = None;
+                        session_events = None;
+                        receiver_events = None;
+                        if let Some(r) = receiver.take() {
+                            r.close().await;
                         }
-                    },
+                        shared.capturing.store(false, Ordering::SeqCst);
+                    }
+                    Cmd::Sides(sides) => {
+                        if let Some(r) = receiver.as_mut() {
+                            r.set_sides(sides).await;
+                        }
+                    }
                     Cmd::Inject(message) => {
                         if let Some(sender) = sender.as_mut() {
                             let screens = shared.screens.lock().expect("screens lock");
@@ -745,8 +883,10 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
                 }
             }
             Some(Ok(event)) = async { match receiver_events.as_mut() { Some(s) => s.next().await, None => None } } => {
-                if let Some(r) = receiver.as_mut() {
-                    r.event(event);
+                if let Some(r) = receiver.as_mut()
+                    && r.event(event)
+                {
+                    r.check_wanted(&shared).await;
                 }
             }
             Some(zones) = async { match session_events.as_mut() { Some(s) => s.next().await, None => None } } => {
@@ -784,7 +924,14 @@ impl Capture for WaylandCapture {
             .map_err(|_| InputError::System("the portal thread stopped".into()))
     }
 
-    fn stop(&mut self) {}
+    fn stop(&mut self) {
+        let _ = self.tx.send(Cmd::StopCapture);
+    }
+
+    fn open_sides(&self, sides: &[Side]) {
+        *self.shared.sides.lock().expect("sides lock") = sides.to_vec();
+        let _ = self.tx.send(Cmd::Sides(sides.to_vec()));
+    }
 
     fn health(&self) -> Health {
         Health {
@@ -847,11 +994,23 @@ mod tests {
     fn barriers_only_on_open_edges() {
         // Two screens side by side: the shared edge gets no barrier
         let zones = [(0, 0, 1920, 1080), (1920, 0, 1280, 1024)];
-        let positions: Vec<_> = barriers(&zones).iter().map(|b| b.position().as_tuple()).collect();
+        let all = [Side::Left, Side::Right, Side::Top, Side::Bottom];
+        let positions: Vec<_> = barriers(&zones, &all).iter().map(|b| b.position().as_tuple()).collect();
         assert_eq!(positions.len(), 6);
         assert!(positions.contains(&(0, 0, 0, 1079)));
         assert!(positions.contains(&(3200, 0, 3200, 1023)));
         assert!(!positions.contains(&(1920, 0, 1920, 1079)));
         assert!(positions.contains(&(0, 1080, 1919, 1080)));
+    }
+
+    #[test]
+    fn barriers_only_where_a_computer_lies_beyond() {
+        let zones = [(0, 0, 1440, 900)];
+        assert!(barriers(&zones, &[]).is_empty());
+        let positions: Vec<_> = barriers(&zones, &[Side::Right])
+            .iter()
+            .map(|b| b.position().as_tuple())
+            .collect();
+        assert_eq!(positions, vec![(1440, 0, 1440, 899)]);
     }
 }

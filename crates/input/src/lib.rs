@@ -36,7 +36,7 @@ mod windows;
 
 use std::sync::Arc;
 
-use tc_core::{Captured, Point};
+use tc_core::{Captured, Point, Side};
 use tc_protocol::{Message, Screen};
 
 pub use virtual_input::{VirtualCapture, VirtualDevice, VirtualInject, virtual_backend};
@@ -131,6 +131,9 @@ pub trait Capture: Send {
     fn single_push_at_edges(&self) -> bool {
         false
     }
+    /// The sides of this computer where a computer that is online lies beyond. Wayland puts
+    /// barriers only there: a barrier holds the pointer until it is given back.
+    fn open_sides(&self, _sides: &[Side]) {}
     /// macOS: pause AWDL (the radio of AirDrop, Handoff and AirPlay) through the system helper
     /// while the pointer is shared; it makes Wi-Fi packets wait every few seconds.
     fn quiet_radio(&self, _quiet: bool) {}
