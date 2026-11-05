@@ -398,7 +398,7 @@ struct Receiver {
     /// The pointer is captured (between an activation and its release).
     active: bool,
     park: (f64, f64),
-    handler: Handler,
+    handler: SharedHandler,
     /// Capturing is switched on (barriers may only be set while it is off: GNOME refuses them
     /// otherwise, and a second switching on as well).
     enabled: bool,
@@ -413,6 +413,16 @@ struct Receiver {
     /// Since when input comes over EI that no computer takes (the activation was missed, or giving
     /// the pointer back failed): the compositor holds the pointer for nobody.
     unwanted_since: Option<Instant>,
+    /// The compositor ended the session (screen locked, for one): a new one is needed.
+    lost: bool,
+}
+
+/// The handler outlives a capture session: a new one takes it over.
+type SharedHandler = Arc<Mutex<Handler>>;
+
+/// Gone means gone for good: the compositor ended the session.
+fn session_gone(e: &ashpd::Error) -> bool {
+    e.to_string().contains("Invalid session")
 }
 
 /// How long after changing the barriers a "Disabled" signal is taken for its echo.
@@ -426,6 +436,9 @@ const SWITCHED_OFF_WINDOW: Duration = Duration::from_secs(60);
 /// The compositor takes injected motion for a push against a barrier as well: an activation this
 /// soon after moving the pointer for another computer came from there, not from the user.
 const INJECTED_LATELY: Duration = Duration::from_millis(500);
+/// A session the system ended is opened anew after this pause, and at most this often.
+const REOPEN_AFTER: Duration = Duration::from_secs(3);
+const REOPEN_AT_MOST_EVERY: Duration = Duration::from_secs(60);
 /// Input over EI that no computer takes for this long: the pointer is given back.
 const UNWANTED_FOR: Duration = Duration::from_millis(500);
 
@@ -515,7 +528,7 @@ fn pushed_out(zones: &[(i32, i32, i32, i32)], x: f64, y: f64) -> (f64, f64, f64,
 }
 
 async fn open_receiver(
-    handler: Handler,
+    handler: SharedHandler,
     sides: Vec<Side>,
 ) -> Result<(Receiver, reis::tokio::EiConvertEventStream), ashpd::Error> {
     let portal = InputCapture::new().await?;
@@ -592,6 +605,7 @@ async fn open_receiver(
             sides,
             refresh_later: false,
             unwanted_since: None,
+            lost: false,
         },
         events,
     ))
@@ -612,7 +626,7 @@ impl Receiver {
         let (x, y, dx, dy) = pushed_out(&self.zones, x, y);
         self.park = (x, y);
         self.unwanted_since = None;
-        let _ = (self.handler)(Captured::Motion { x, y, dx, dy });
+        let _ = (self.handler.lock().expect("handler lock"))(Captured::Motion { x, y, dx, dy });
         let grabbed = shared.grabbed.load(Ordering::SeqCst);
         tracing::info!(
             "the pointer hit an edge at ({x:.0}, {y:.0}), activation {activation:?}, {}",
@@ -710,6 +724,7 @@ impl Receiver {
         if self.enabled {
             if let Err(e) = self.portal.disable(&self.session, DisableOptions::default()).await {
                 tracing::warn!("cannot switch capturing off to renew the screen edges: {e}");
+                self.lost |= session_gone(&e);
             }
             self.enabled = false;
         }
@@ -749,7 +764,10 @@ impl Receiver {
                 self.zones,
                 if self.enabled { "" } else { ", capturing stays off" }
             ),
-            Err(e) => tracing::warn!("cannot renew the screen edges for capturing: {e}"),
+            Err(e) => {
+                tracing::warn!("cannot renew the screen edges for capturing: {e}");
+                self.lost |= session_gone(&e);
+            }
         }
     }
 
@@ -827,6 +845,7 @@ impl Receiver {
             }
             EiEvent::Disconnected(e) => {
                 tracing::warn!("input capture connection ended: {:?}", e.reason);
+                self.lost = true;
                 None
             }
             _ => None,
@@ -834,7 +853,7 @@ impl Receiver {
         let _ = self.connection.flush();
         let input = captured.is_some();
         if let Some(captured) = captured {
-            let _ = (self.handler)(captured);
+            let _ = (self.handler.lock().expect("handler lock"))(captured);
         }
         input
     }
@@ -874,20 +893,63 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
     let mut receiver_events: Option<reis::tokio::EiConvertEventStream> = None;
     let mut activated: Option<LocalBoxStream<'static, Activated>> = None;
     let mut session_events: Option<LocalBoxStream<'static, bool>> = None;
+    let mut handler: Option<SharedHandler> = None;
+    // A lost session is opened anew after a pause (and at most once a minute: it may ask again)
+    let mut reopen: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut reopened: Option<Instant> = None;
     loop {
+        if receiver.as_ref().is_some_and(|r| r.lost) && reopen.is_none() {
+            let wait = match reopened {
+                Some(at) if at.elapsed() < REOPEN_AT_MOST_EVERY => REOPEN_AT_MOST_EVERY - at.elapsed(),
+                _ => REOPEN_AFTER,
+            };
+            tracing::warn!(
+                "the system ended the input capture session, opening a new one in {} s",
+                wait.as_secs()
+            );
+            receiver = None;
+            receiver_events = None;
+            activated = None;
+            session_events = None;
+            shared.capturing.store(false, Ordering::SeqCst);
+            reopen = Some(Box::pin(tokio::time::sleep(wait)));
+        }
         tokio::select! {
+            () = async { match reopen.as_mut() { Some(s) => s.await, None => std::future::pending().await } } => {
+                reopen = None;
+                reopened = Some(Instant::now());
+                if let Some(handler) = handler.clone() {
+                    activated = activations().await;
+                    session_events = session_signals().await;
+                    let sides = shared.sides.lock().expect("sides lock").clone();
+                    match open_receiver(handler, sides).await {
+                        Ok((r, events)) => {
+                            receiver = Some(r);
+                            receiver_events = Some(events);
+                            shared.capturing.store(true, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            tracing::warn!("no new input capture session: {e}");
+                            shared.problems.lock().expect("problems lock").push(Problem::CaptureStopped);
+                        }
+                    }
+                }
+            }
             command = rx.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    Cmd::StartCapture(handler) => {
+                    Cmd::StartCapture(new) => {
                         if let Some(old) = receiver.take() {
                             old.close().await;
                         }
+                        reopen = None;
+                        let new = Arc::new(Mutex::new(new));
+                        handler = Some(new.clone());
                         // Listening before capturing is switched on: an activation must not get lost
                         activated = activations().await;
                         session_events = session_signals().await;
                         let sides = shared.sides.lock().expect("sides lock").clone();
-                        match open_receiver(handler, sides).await {
+                        match open_receiver(new, sides).await {
                             Ok((r, events)) => {
                                 // Without an absolute pointer the screens come from the capture zones
                                 {
@@ -917,6 +979,8 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
                         }
                     }
                     Cmd::StopCapture => {
+                        reopen = None;
+                        handler = None;
                         activated = None;
                         session_events = None;
                         receiver_events = None;

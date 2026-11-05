@@ -84,7 +84,8 @@ pub fn fetch(url: &str, accept: Option<&str>, seconds: u32, to: Option<&Path>) -
         curl.args(["-H", &format!("Accept: {accept}")]);
     }
     if let Some(to) = to {
-        curl.arg("-o").arg(to);
+        // A download takes long enough for a weak Wi-Fi to drop out on the way
+        curl.args(["--retry", "3"]).arg("-o").arg(to);
     }
     curl.arg(url);
     let out = match curl.output() {
@@ -106,8 +107,18 @@ pub fn fetch(url: &str, accept: Option<&str>, seconds: u32, to: Option<&Path>) -
         }
         other => other,
     };
-    let out = out.ok().filter(|o| o.status.success()).ok_or(CheckError::Unreachable)?;
-    Ok(out.stdout)
+    match out {
+        Ok(out) if out.status.success() => Ok(out.stdout),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            tracing::warn!("fetching {url} failed ({}): {}", out.status, err.trim());
+            Err(CheckError::Unreachable)
+        }
+        Err(e) => {
+            tracing::warn!("fetching {url} failed: {e}");
+            Err(CheckError::Unreachable)
+        }
+    }
 }
 
 fn check() -> Result<Option<NewVersion>, CheckError> {
