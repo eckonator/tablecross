@@ -65,6 +65,8 @@ struct Shared {
     problems: Mutex<Vec<Problem>>,
     /// Where a computer lies beyond: only these sides get barriers.
     sides: Mutex<Vec<Side>>,
+    /// When the pointer was last moved for another computer.
+    moved_for_peer: Mutex<Option<Instant>>,
 }
 
 pub fn backend() -> Result<Backend, InputError> {
@@ -373,6 +375,9 @@ const SETTLE_AFTER_DISABLED: Duration = Duration::from_secs(1);
 /// Switched off this often within `SWITCHED_OFF_WINDOW`, capturing stays off.
 const SWITCHED_OFF_LIMIT: usize = 5;
 const SWITCHED_OFF_WINDOW: Duration = Duration::from_secs(60);
+/// The compositor takes injected motion for a push against a barrier as well: an activation this
+/// soon after moving the pointer for another computer came from there, not from the user.
+const INJECTED_LATELY: Duration = Duration::from_millis(500);
 /// Input over EI that no computer takes for this long: the pointer is given back.
 const UNWANTED_FOR: Duration = Duration::from_millis(500);
 
@@ -526,6 +531,12 @@ impl Receiver {
     async fn activated(&mut self, activation: Option<u32>, at: (f32, f32), shared: &Shared) {
         self.activation = activation;
         self.active = true;
+        let moved = *shared.moved_for_peer.lock().expect("moved lock");
+        if moved.is_some_and(|t| t.elapsed() < INJECTED_LATELY) {
+            tracing::debug!("the injected pointer hit an edge (activation {activation:?}), giving it back");
+            self.release(None).await;
+            return;
+        }
         let (x, y) = (f64::from(at.0), f64::from(at.1));
         let (x, y, dx, dy) = pushed_out(&self.zones, x, y);
         self.park = (x, y);
@@ -961,6 +972,9 @@ impl Inject for WaylandInject {
     }
 
     fn inject(&self, message: &Message) -> Result<(), InputError> {
+        if matches!(message, Message::Enter { .. } | Message::MouseMove { .. }) {
+            *self.shared.moved_for_peer.lock().expect("moved lock") = Some(Instant::now());
+        }
         let _ = self.tx.send(Cmd::Inject(message.clone()));
         Ok(())
     }

@@ -566,6 +566,15 @@ fn only_edges_with_a_computer_online_behind_them_are_open() {
     let open = |sim: &Sim, m: &str| sim.machines[m].engine.open_sides();
     assert_eq!(open(&sim, "book"), vec![Side::Right]);
     assert_eq!(open(&sim, "middle"), vec![Side::Left, Side::Right]);
+    // Controlled, the edges belong to the controlling machine
+    sim.machines.get_mut("book").unwrap().os.pointer = Point::new(990.0, 200.0);
+    sim.glide("book", 20.0, 0.0);
+    assert_eq!(sim.role("middle"), Role::ControlledBy("book".into()));
+    assert!(open(&sim, "middle").is_empty());
+    assert_eq!(open(&sim, "book"), vec![Side::Right]);
+    sim.glide("book", -100.0, 0.0);
+    assert_eq!(sim.role("book"), Role::Idle);
+    assert_eq!(open(&sim, "middle"), vec![Side::Left, Side::Right]);
     sim.disconnect("book", "middle");
     // Past the one that is away
     assert_eq!(open(&sim, "book"), vec![Side::Right]);

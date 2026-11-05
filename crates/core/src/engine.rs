@@ -347,8 +347,12 @@ impl Engine {
     }
 
     /// The sides of this machine the pointer can leave over: a machine that is online lies beyond
-    /// them somewhere along the edge (past ones that are not, if allowed).
+    /// them somewhere along the edge (past ones that are not, if allowed). None while another
+    /// machine controls this one: its pointer moves here, and that one decides about the edges.
     pub fn open_sides(&self) -> Vec<Side> {
+        if matches!(self.mode, Mode::Controlled { .. }) {
+            return Vec::new();
+        }
         let online = |m: &str| self.machines.contains_key(m);
         [Side::Left, Side::Right, Side::Top, Side::Bottom]
             .into_iter()
