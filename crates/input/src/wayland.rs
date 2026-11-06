@@ -351,6 +351,23 @@ impl Sender {
         }
     }
 
+    /// Moves the pointer another computer left on the outermost row or column of the screens a
+    /// little inside, off where the barriers of `sides` will lie.
+    fn step_off_edges(&mut self, sides: &[Side]) {
+        let Some((x, y)) = self.position else { return };
+        let (to_x, to_y) = off_edges(&self.screens, sides, x, y);
+        if (to_x, to_y) != (x, y) {
+            tracing::info!("the pointer was left at ({x:.0}, {y:.0}) on an edge, moving it to ({to_x:.0}, {to_y:.0})");
+            self.inject(&Message::MouseMove {
+                seq: 0,
+                x: to_x,
+                y: to_y,
+                dx: 0.0,
+                dy: 0.0,
+            });
+        }
+    }
+
     fn release_all(&mut self) {
         for usage in self.keys.clone().release_all() {
             self.inject(&Message::Key { usage, down: false });
@@ -361,16 +378,44 @@ impl Sender {
     }
 }
 
+fn on_screens(screens: &[Screen], x: f32, y: f32) -> bool {
+    screens.iter().any(|s| {
+        x >= s.x as f32 && x < (s.x + s.width as i32) as f32 && y >= s.y as f32 && y < (s.y + s.height as i32) as f32
+    })
+}
+
+/// How far from a barrier a pointer left by another computer is put.
+const OFF_EDGE: f32 = 2.0;
+
+/// `(x, y)`, but at least `OFF_EDGE` away from the outer edges on `sides`. A barrier lies on the
+/// first row or column of the screens: GNOME holds a pointer that stands on one there, so neither
+/// the trackpad moves it nor does pushing on count as hitting the barrier.
+fn off_edges(screens: &[Screen], sides: &[Side], x: f32, y: f32) -> (f32, f32) {
+    let on = |x: f32, y: f32| on_screens(screens, x, y);
+    let Some(s) = screens.iter().find(|s| on_screens(std::slice::from_ref(s), x, y)) else {
+        return (x, y);
+    };
+    let (left, top) = (s.x as f32, s.y as f32);
+    let (right, bottom) = (left + s.width as f32, top + s.height as f32);
+    let (mut to_x, mut to_y) = (x, y);
+    if sides.contains(&Side::Left) && x < left + OFF_EDGE && !on(left - 1.0, y) {
+        to_x = left + OFF_EDGE;
+    }
+    if sides.contains(&Side::Right) && x > right - OFF_EDGE && !on(right, y) {
+        to_x = right - OFF_EDGE;
+    }
+    if sides.contains(&Side::Top) && y < top + OFF_EDGE && !on(x, top - 1.0) {
+        to_y = top + OFF_EDGE;
+    }
+    if sides.contains(&Side::Bottom) && y > bottom - OFF_EDGE && !on(x, bottom) {
+        to_y = bottom - OFF_EDGE;
+    }
+    (to_x, to_y)
+}
+
 /// The part of the motion `(dx, dy)` at `(x, y)` that pushes over an outer edge of the screens.
 fn beyond_edge(screens: &[Screen], x: f32, y: f32, dx: f32, dy: f32) -> (f32, f32) {
-    let on = |x: f32, y: f32| {
-        screens.iter().any(|s| {
-            x >= s.x as f32
-                && x < (s.x + s.width as i32) as f32
-                && y >= s.y as f32
-                && y < (s.y + s.height as i32) as f32
-        })
-    };
+    let on = |x: f32, y: f32| on_screens(screens, x, y);
     if !on(x, y) {
         return (0.0, 0.0);
     }
@@ -436,6 +481,9 @@ const SWITCHED_OFF_WINDOW: Duration = Duration::from_secs(60);
 /// The compositor takes injected motion for a push against a barrier as well: an activation this
 /// soon after moving the pointer for another computer came from there, not from the user.
 const INJECTED_LATELY: Duration = Duration::from_millis(500);
+/// Sides that open this soon after moving the pointer for another computer: it just left, and the
+/// pointer still stands where it left it.
+const LEFT_LATELY: Duration = Duration::from_secs(1);
 /// Barriers change only after the sides stayed the same this long (and as long after capturing
 /// was switched on).
 const SIDES_SETTLE: Duration = Duration::from_millis(1500);
@@ -1009,6 +1057,13 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
                         shared.capturing.store(false, Ordering::SeqCst);
                     }
                     Cmd::Sides(sides) => {
+                        // Another computer just let go of the pointer (the sides open again then)
+                        let moved = *shared.moved_for_peer.lock().expect("moved lock");
+                        if moved.is_some_and(|t| t.elapsed() < LEFT_LATELY)
+                            && let Some(sender) = sender.as_mut()
+                        {
+                            sender.step_off_edges(&sides);
+                        }
                         pending_sides = Some(sides);
                         sides_due = Some(Box::pin(tokio::time::sleep(SIDES_SETTLE)));
                     }
@@ -1196,6 +1251,41 @@ mod tests {
         assert_eq!(beyond_edge(&screens, 1439.0, 400.0, 4.0, 0.0), (0.0, 0.0));
         // The top left corner
         assert_eq!(beyond_edge(&screens, 0.0, 0.0, -2.0, -3.0), (-2.0, -3.0));
+    }
+
+    #[test]
+    fn a_pointer_left_on_an_edge_steps_off_its_barrier() {
+        let screens = [
+            Screen {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900,
+                scale: 1.0,
+            },
+            Screen {
+                x: 1440,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale: 1.0,
+            },
+        ];
+        // Left over the top: it stands on the barrier
+        assert_eq!(off_edges(&screens, &[Side::Top], 610.0, 0.0), (610.0, 2.0));
+        // No barrier there, or away from it already
+        assert_eq!(off_edges(&screens, &[Side::Bottom], 610.0, 0.0), (610.0, 0.0));
+        assert_eq!(off_edges(&screens, &[Side::Top], 610.0, 40.0), (610.0, 40.0));
+        // Between the screens is no outer edge, below the smaller one is
+        assert_eq!(
+            off_edges(&screens, &[Side::Left, Side::Right], 1439.0, 400.0),
+            (1439.0, 400.0)
+        );
+        assert_eq!(off_edges(&screens, &[Side::Bottom], 700.0, 899.5), (700.0, 898.0));
+        // The top left corner
+        assert_eq!(off_edges(&screens, &[Side::Left, Side::Top], 0.0, 0.0), (2.0, 2.0));
+        // Off the screens: left alone
+        assert_eq!(off_edges(&screens, &[Side::Top], -5.0, -5.0), (-5.0, -5.0));
     }
 
     #[test]
