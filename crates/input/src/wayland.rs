@@ -384,6 +384,19 @@ fn on_screens(screens: &[Screen], x: f32, y: f32) -> bool {
     })
 }
 
+fn zone_screens(zones: &[(i32, i32, i32, i32)]) -> Vec<Screen> {
+    zones
+        .iter()
+        .map(|&(x, y, w, h)| Screen {
+            x,
+            y,
+            width: w.max(0) as u32,
+            height: h.max(0) as u32,
+            scale: 1.0,
+        })
+        .collect()
+}
+
 /// How far from a barrier a pointer left by another computer is put.
 const OFF_EDGE: f32 = 2.0;
 
@@ -692,6 +705,12 @@ impl Receiver {
     /// Gives the pointer back to the compositor. If it refuses twice, capturing is switched off,
     /// which ends the capture as well, and on again with fresh barriers.
     async fn release(&mut self, at: Option<(f64, f64)>) {
+        // Given back on a barrier, the next motion would hit it again at once
+        let screens = zone_screens(&self.zones);
+        let at = at.map(|(x, y)| {
+            let (x, y) = off_edges(&screens, &self.sides, x as f32, y as f32);
+            (f64::from(x), f64::from(y))
+        });
         let mut refused = None;
         for attempt in 0..2 {
             let options = ReleaseOptions::default()
@@ -1019,17 +1038,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: Arc<Shared>) {
                                 {
                                     let mut screens = shared.screens.lock().expect("screens lock");
                                     if screens.is_empty() {
-                                        *screens = r
-                                            .zones
-                                            .iter()
-                                            .map(|&(x, y, w, h)| Screen {
-                                                x,
-                                                y,
-                                                width: w.max(0) as u32,
-                                                height: h.max(0) as u32,
-                                                scale: 1.0,
-                                            })
-                                            .collect();
+                                        *screens = zone_screens(&r.zones);
                                     }
                                 }
                                 receiver = Some(r);
