@@ -42,6 +42,8 @@ pub struct HelperStatus {
     pub version_mismatch: Option<u16>,
     /// The connected helper's version.
     pub version: u16,
+    /// The first attempt to reach the helper is over (until then it is not missing yet).
+    pub tried: bool,
 }
 
 pub struct HelperClient {
@@ -73,6 +75,7 @@ impl HelperClient {
                     if let Ok(stream) = UnixStream::connect(socket_path()) {
                         client.serve(stream, on_key.clone());
                     }
+                    client.status.lock().expect("helper status").tried = true;
                     drop(client);
                     std::thread::sleep(RECONNECT);
                 }
@@ -121,6 +124,7 @@ impl HelperClient {
                         connected: true,
                         access,
                         version,
+                        tried: true,
                         ..HelperStatus::default()
                     };
                     drop(status);

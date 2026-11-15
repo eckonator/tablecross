@@ -618,6 +618,8 @@ impl Capture for MacCapture {
                 problems.push(Problem::HelperOutdated);
                 false
             }
+            // Right after the start the first connection is still on its way
+            Some(status) if !status.tried => false,
             _ => {
                 problems.push(Problem::HelperMissing);
                 false
